@@ -1,17 +1,15 @@
-python3 - <<'PY'
+
 import evdev
 from evdev import ecodes
 for p in evdev.list_devices():
     d = evdev.InputDevice(p)
-    caps = d.capabilities(verbose=False)
-    abs_codes = [c for c, _ in caps.get(ecodes.EV_ABS, [])]
-    key_codes = caps.get(ecodes.EV_KEY, [])
-    tool_keys = [k for k in key_codes if 0x140 <= k <= 0x14f]
-    def name(table, code):
-        v = table.get(code)
-        return v if isinstance(v, str) else (v[0] if v else str(code))
-    print(f"{p}  {d.name!r}")
-    print(f"  ABS  : {[name(ecodes.ABS, c) for c in abs_codes]}")
-    print(f"  BTN_*: {[name(ecodes.KEY, k) for k in tool_keys]}")
+    caps = d.capabilities()
+    abs_map = {c: i for c, i in caps.get(ecodes.EV_ABS, [])}
+    if ecodes.ABS_TILT_X in abs_map:
+        tx = abs_map[ecodes.ABS_TILT_X]
+        ty = abs_map.get(ecodes.ABS_TILT_Y)
+        print(f"{p}  {d.name!r}")
+        print(f"  ABS_TILT_X: min={tx.min} max={tx.max} res={tx.resolution}")
+        if ty is not None:
+            print(f"  ABS_TILT_Y: min={ty.min} max={ty.max} res={ty.resolution}")
     d.close()
-PY
