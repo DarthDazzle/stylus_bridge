@@ -40,6 +40,19 @@ def get_abs(dev, code):
     return None
 
 
+def physical_mm(axinfo):
+    """Returns axis physical extent in mm, or None if resolution unavailable.
+
+    evdev convention: ABS_X / ABS_Y resolution is units/mm.
+    """
+    if axinfo is None:
+        return None
+    res = getattr(axinfo, "resolution", 0) or 0
+    if res > 0:
+        return (axinfo.max - axinfo.min) / res
+    return None
+
+
 def tilt_deg_per_unit(axinfo):
     """Convert raw evdev tilt-axis units to degrees.
 
@@ -192,14 +205,20 @@ def main():
 
     x_range = max(1, ax.max - ax.min)
     y_range = max(1, ay.max - ay.min)
-    tablet_aspect = x_range / y_range
+    raw_aspect = x_range / y_range
+    phys_x = physical_mm(ax)
+    phys_y = physical_mm(ay)
+    if phys_x and phys_y:
+        tablet_aspect = phys_x / phys_y
+    else:
+        tablet_aspect = raw_aspect
     dist_max = ad.max if ad is not None else 0
     tilt_x_scale = tilt_deg_per_unit(atx)
     tilt_y_scale = tilt_deg_per_unit(aty)
 
     print(f"Device: {dev.name}  ({dev.path})", flush=True)
-    print(f"  ABS_X: [{ax.min}, {ax.max}]", flush=True)
-    print(f"  ABS_Y: [{ay.min}, {ay.max}]", flush=True)
+    print(f"  ABS_X: [{ax.min}, {ax.max}]  res={ax.resolution}", flush=True)
+    print(f"  ABS_Y: [{ay.min}, {ay.max}]  res={ay.resolution}", flush=True)
     print(f"  ABS_PRESSURE: [0, {ap_.max}]", flush=True)
     if ad is not None:
         print(f"  ABS_DISTANCE: [0, {ad.max}]", flush=True)
@@ -209,7 +228,13 @@ def main():
     if aty is not None:
         print(f"  ABS_TILT_Y: [{aty.min}, {aty.max}]  res={aty.resolution}  "
               f"-> {tilt_y_scale:.6f} deg/unit", flush=True)
-    print(f"  tablet aspect = {tablet_aspect:.6f}", flush=True)
+    if phys_x and phys_y:
+        print(f"  physical area: {phys_x:.2f} x {phys_y:.2f} mm", flush=True)
+        print(f"  tablet aspect: physical={tablet_aspect:.6f}  "
+              f"raw={raw_aspect:.6f}", flush=True)
+    else:
+        print(f"  tablet aspect: raw={raw_aspect:.6f}  "
+              "(no resolution; cannot correct)", flush=True)
 
     if args.server:
         host, port = args.server.split(":")
