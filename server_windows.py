@@ -109,9 +109,9 @@ class POINTER_TYPE_INFO(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint32), ("u", _PTI_UNION)]
 
 
-user32.InitializeSyntheticPointerDevice.argtypes = [
+user32.CreateSyntheticPointerDevice.argtypes = [
     ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
-user32.InitializeSyntheticPointerDevice.restype = wt.HANDLE
+user32.CreateSyntheticPointerDevice.restype = wt.HANDLE
 
 user32.InjectSyntheticPointerInput.argtypes = [
     wt.HANDLE, ctypes.POINTER(POINTER_TYPE_INFO), ctypes.c_uint32]
@@ -273,11 +273,11 @@ def main():
     print(f"Using monitor [{idx}] {mon['device']} "
           f"{mr - ml}x{mb - mt} @ ({ml},{mt})", flush=True)
 
-    pen_device = user32.InitializeSyntheticPointerDevice(
+    pen_device = user32.CreateSyntheticPointerDevice(
         PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
     if not pen_device:
         err = ctypes.get_last_error()
-        print(f"InitializeSyntheticPointerDevice failed (GetLastError={err}). "
+        print(f"CreateSyntheticPointerDevice failed (GetLastError={err}). "
               "Requires Windows 10 1809 or later.", file=sys.stderr)
         sys.exit(1)
 
