@@ -337,6 +337,7 @@ def main():
 
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     data_sock.bind(("0.0.0.0", protocol.DATA_PORT))
+    data_sock.settimeout(0.5)  # let Python process Ctrl+C on Windows
     print(f"Listening for stylus data on UDP/{protocol.DATA_PORT}", flush=True)
 
     last_seq = -1
@@ -347,6 +348,8 @@ def main():
         while True:
             try:
                 data, addr = data_sock.recvfrom(64)
+            except TimeoutError:
+                continue
             except OSError as e:
                 print(f"recv error: {e}", file=sys.stderr)
                 continue
