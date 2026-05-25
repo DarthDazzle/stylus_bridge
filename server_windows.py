@@ -46,6 +46,19 @@ PEN_FLAG_BARREL   = 0x00000001
 PEN_FLAG_INVERTED = 0x00000002
 PEN_FLAG_ERASER   = 0x00000004
 
+# SendInput
+INPUT_MOUSE    = 0
+INPUT_KEYBOARD = 1
+
+MOUSEEVENTF_LEFTDOWN   = 0x0002
+MOUSEEVENTF_LEFTUP     = 0x0004
+MOUSEEVENTF_RIGHTDOWN  = 0x0008
+MOUSEEVENTF_RIGHTUP    = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP   = 0x0040
+
+KEYEVENTF_KEYUP = 0x0002
+
 MONITORINFOF_PRIMARY = 0x00000001
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 
@@ -124,6 +137,49 @@ user32.InjectSyntheticPointerInput.restype = wt.BOOL
 
 user32.DestroySyntheticPointerDevice.argtypes = [wt.HANDLE]
 user32.DestroySyntheticPointerDevice.restype = None
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", wt.DWORD),
+        ("dwFlags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", wt.WPARAM),
+    ]
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wt.WORD),
+        ("wScan", wt.WORD),
+        ("dwFlags", wt.DWORD),
+        ("time", wt.DWORD),
+        ("dwExtraInfo", wt.WPARAM),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wt.DWORD),
+        ("wParamL", wt.WORD),
+        ("wParamH", wt.WORD),
+    ]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wt.DWORD), ("u", _INPUT_UNION)]
+
+
+user32.SendInput.argtypes = [wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = wt.UINT
+
 
 shcore.GetDpiForMonitor.argtypes = [
     wt.HMONITOR, ctypes.c_int,
@@ -225,15 +281,16 @@ def make_pen_info(x_px, y_px, x_him, y_him, pressure_1024,
     return info
 
 
-def derive_flags(in_range, in_contact, was_in_range, was_in_contact, barrel):
+def derive_flags(in_range, in_contact, was_in_range, was_in_contact,
+                 barrel, barrel_uses_pen_flag):
     flags = 0
     pen_flags = 0
     if in_range:
         flags |= POINTER_FLAG_INRANGE
     if in_contact:
         flags |= POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON
-    if barrel:
-        flags |= POINTER_FLAG_THIRDBUTTON
+    if barrel and barrel_uses_pen_flag:
+        flags |= POINTER_FLAG_SECONDBUTTON
         pen_flags |= PEN_FLAG_BARREL
 
     # Edge detection
@@ -244,6 +301,110 @@ def derive_flags(in_range, in_contact, was_in_range, was_in_contact, barrel):
     else:
         flags |= POINTER_FLAG_UPDATE
     return flags, pen_flags
+
+
+# ---------------------------------------------------------------------------
+# Barrel-button action layer
+# ---------------------------------------------------------------------------
+def _send_inputs(*inputs):
+    n = len(inputs)
+    arr = (INPUT * n)(*inputs)
+    sent = user32.SendInput(n, arr, ctypes.sizeof(INPUT))
+    if sent != n:
+        err = ctypes.get_last_error()
+        print(f"SendInput sent {sent}/{n} (GetLastError={err})", file=sys.stderr)
+
+
+def _mouse_input(flag):
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.mi.dwFlags = flag
+    return inp
+
+
+def _key_input(vk, up=False):
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.ki.wVk = vk
+    inp.ki.dwFlags = KEYEVENTF_KEYUP if up else 0
+    return inp
+
+
+class BarrelAction:
+    uses_pen_barrel_flag = False
+    label = "none"
+    def press(self):  pass
+    def release(self): pass
+
+
+class NoneAction(BarrelAction):
+    label = "none"
+
+
+class PenBarrelAction(BarrelAction):
+    uses_pen_barrel_flag = True
+    label = "barrel (POINTER_FLAG_SECONDBUTTON + PEN_FLAG_BARREL)"
+
+
+class MouseAction(BarrelAction):
+    def __init__(self, name, down_flag, up_flag):
+        self.label = f"mouse-{name}"
+        self._down = down_flag
+        self._up = up_flag
+    def press(self):   _send_inputs(_mouse_input(self._down))
+    def release(self): _send_inputs(_mouse_input(self._up))
+
+
+class KeyAction(BarrelAction):
+    def __init__(self, vk, name):
+        self.label = f"key {name} (VK=0x{vk:02X})"
+        self._vk = vk
+    def press(self):   _send_inputs(_key_input(self._vk, up=False))
+    def release(self): _send_inputs(_key_input(self._vk, up=True))
+
+
+_VK_TABLE = {
+    "SPACE": 0x20, "TAB": 0x09, "ENTER": 0x0D, "ESC": 0x1B, "ESCAPE": 0x1B,
+    "BACKSPACE": 0x08, "DELETE": 0x2E, "INSERT": 0x2D,
+    "SHIFT": 0xA0, "LSHIFT": 0xA0, "RSHIFT": 0xA1,
+    "CTRL": 0xA2, "LCTRL": 0xA2, "RCTRL": 0xA3,
+    "ALT": 0xA4, "LALT": 0xA4, "RALT": 0xA5,
+    "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28,
+    "HOME": 0x24, "END": 0x23, "PAGEUP": 0x21, "PAGEDOWN": 0x22,
+}
+for _c in range(ord("A"), ord("Z") + 1):
+    _VK_TABLE[chr(_c)] = _c
+for _c in range(ord("0"), ord("9") + 1):
+    _VK_TABLE[chr(_c)] = _c
+for _i in range(1, 13):
+    _VK_TABLE[f"F{_i}"] = 0x6F + _i  # VK_F1 = 0x70
+
+
+def parse_barrel_action(spec):
+    s = spec.strip().lower()
+    if s == "barrel":
+        return PenBarrelAction()
+    if s == "none":
+        return NoneAction()
+    if s == "left":
+        return MouseAction("left", MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+    if s == "middle":
+        return MouseAction("middle", MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP)
+    if s == "right":
+        return MouseAction("right", MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+    if s.startswith("key:"):
+        name = spec.split(":", 1)[1].strip()
+        upper = name.upper()
+        if upper in _VK_TABLE:
+            return KeyAction(_VK_TABLE[upper], upper)
+        if name.lower().startswith("0x"):
+            return KeyAction(int(name, 16), name)
+        raise argparse.ArgumentTypeError(
+            f"unknown key name {name!r}; use letter/digit, "
+            "SPACE/TAB/ENTER/ESC/SHIFT/CTRL/ALT/F1-F12/arrows, or 0xNN")
+    raise argparse.ArgumentTypeError(
+        f"unknown barrel action {spec!r}; expected one of: "
+        "barrel, none, left, middle, right, key:NAME")
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +435,14 @@ def main():
     ap = argparse.ArgumentParser(description="Stylus bridge server (Windows)")
     ap.add_argument("--monitor", type=int, default=None,
                     help="monitor index (skips prompt)")
+    ap.add_argument("--barrel-action", default="middle",
+                    help="action for the pen barrel button: "
+                         "barrel | none | left | middle | right | key:NAME "
+                         "(default: middle)")
     args = ap.parse_args()
+
+    action = parse_barrel_action(args.barrel_action)
+    print(f"Barrel-button action: {action.label}", flush=True)
 
     monitors = enumerate_monitors()
     if not monitors:
@@ -345,6 +513,7 @@ def main():
     last_seq = -1
     was_in_range = False
     was_in_contact = False
+    was_barrel = False
 
     try:
         while True:
@@ -378,13 +547,22 @@ def main():
             in_contact = bool(flags_b & int(protocol.Flag.IN_CONTACT))
             barrel = bool(buttons & int(protocol.Button.STYLUS))
 
+            # Barrel edge -> external action (mouse/key). Independent of
+            # in_range so the button still works during pure hover.
+            if barrel and not was_barrel:
+                action.press()
+            elif not barrel and was_barrel:
+                action.release()
+            was_barrel = barrel
+
             if not in_range and not was_in_range:
                 # Stylus left proximity earlier; nothing to inject
                 continue
 
             pressure = int(round(max(0.0, min(1.0, p_n)) * 1024))
             flags, pen_flags = derive_flags(
-                in_range, in_contact, was_in_range, was_in_contact, barrel)
+                in_range, in_contact, was_in_range, was_in_contact,
+                barrel, action.uses_pen_barrel_flag)
             if tool == int(protocol.Tool.RUBBER):
                 pen_flags |= PEN_FLAG_INVERTED | PEN_FLAG_ERASER
 
@@ -403,6 +581,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if was_barrel:
+            action.release()  # avoid stuck mouse/key on shutdown
         user32.DestroySyntheticPointerDevice(pen_device)
 
 
