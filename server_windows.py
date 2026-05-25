@@ -19,9 +19,12 @@ import protocol
 # Win32 bindings
 # ---------------------------------------------------------------------------
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+shcore = ctypes.WinDLL("shcore", use_last_error=True)
 
 PT_PEN = 3
 POINTER_FEEDBACK_DEFAULT = 1
+MDT_EFFECTIVE_DPI = 0
+HIMETRIC_PER_INCH = 2540  # 1 inch = 2540 HIMETRIC units (0.01 mm)
 
 POINTER_FLAG_NONE         = 0x00000000
 POINTER_FLAG_NEW          = 0x00000001
@@ -120,6 +123,11 @@ user32.InjectSyntheticPointerInput.restype = wt.BOOL
 user32.DestroySyntheticPointerDevice.argtypes = [wt.HANDLE]
 user32.DestroySyntheticPointerDevice.restype = None
 
+shcore.GetDpiForMonitor.argtypes = [
+    wt.HMONITOR, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+shcore.GetDpiForMonitor.restype = ctypes.c_long  # HRESULT
+
 try:
     user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
     user32.SetProcessDpiAwarenessContext.restype = wt.BOOL
@@ -154,6 +162,7 @@ def enumerate_monitors():
         user32.GetMonitorInfoW(hmon, ctypes.byref(info))
         r = info.rcMonitor
         monitors.append({
+            "hmon": int(hmon) if hmon else 0,
             "device": info.szDevice,
             "rect": (r.left, r.top, r.right, r.bottom),
             "primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
@@ -189,13 +198,16 @@ def compute_fit_box(tablet_aspect, mon_rect):
 # ---------------------------------------------------------------------------
 # Injection
 # ---------------------------------------------------------------------------
-def make_pen_info(x_px, y_px, pressure_1024, tilt_x_deg, tilt_y_deg,
-                  flags, pen_flags):
+def make_pen_info(x_px, y_px, x_him, y_him, pressure_1024,
+                  tilt_x_deg, tilt_y_deg, flags, pen_flags):
     pi = POINTER_INFO()
     pi.pointerType = PT_PEN
     pi.pointerId = 1
     pi.pointerFlags = flags
     pi.ptPixelLocation = POINT(int(round(x_px)), int(round(y_px)))
+    pi.ptHimetricLocation = POINT(int(round(x_him)), int(round(y_him)))
+    pi.ptPixelLocationRaw = pi.ptPixelLocation
+    pi.ptHimetricLocationRaw = pi.ptHimetricLocation
 
     pen = POINTER_PEN_INFO()
     pen.pointerInfo = pi
@@ -273,6 +285,19 @@ def main():
     print(f"Using monitor [{idx}] {mon['device']} "
           f"{mr - ml}x{mb - mt} @ ({ml},{mt})", flush=True)
 
+    dpix = ctypes.c_uint(96)
+    dpiy = ctypes.c_uint(96)
+    hr = shcore.GetDpiForMonitor(mon["hmon"], MDT_EFFECTIVE_DPI,
+                                  ctypes.byref(dpix), ctypes.byref(dpiy))
+    if hr != 0:
+        print(f"GetDpiForMonitor failed: HRESULT=0x{hr & 0xFFFFFFFF:08x}; "
+              "using 96 DPI fallback.", file=sys.stderr)
+        dpix.value, dpiy.value = 96, 96
+    him_per_px_x = HIMETRIC_PER_INCH / dpix.value
+    him_per_px_y = HIMETRIC_PER_INCH / dpiy.value
+    print(f"Monitor DPI: {dpix.value} x {dpiy.value}  "
+          f"(HIMETRIC/px = {him_per_px_x:.3f} x {him_per_px_y:.3f})", flush=True)
+
     pen_device = user32.CreateSyntheticPointerDevice(
         PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
     if not pen_device:
@@ -341,6 +366,8 @@ def main():
             bl, bt, bw, bh = fit_box["value"]
             x_px = bl + max(0.0, min(1.0, x_n)) * bw
             y_px = bt + max(0.0, min(1.0, y_n)) * bh
+            x_him = x_px * him_per_px_x
+            y_him = y_px * him_per_px_y
 
             in_range = bool(flags_b & int(protocol.Flag.IN_RANGE))
             in_contact = bool(flags_b & int(protocol.Flag.IN_CONTACT))
@@ -354,7 +381,8 @@ def main():
             flags, pen_flags = derive_flags(
                 in_range, in_contact, was_in_range, was_in_contact, barrel)
 
-            info = make_pen_info(x_px, y_px, pressure, tx, ty, flags, pen_flags)
+            info = make_pen_info(x_px, y_px, x_him, y_him,
+                                 pressure, tx, ty, flags, pen_flags)
             ok = user32.InjectSyntheticPointerInput(
                 pen_device, ctypes.byref(info), 1)
             if not ok:
