@@ -5,6 +5,7 @@ Requires: python-evdev (`pip install evdev`), user in `input` group.
 """
 import argparse
 import asyncio
+import math
 import socket
 import struct
 import sys
@@ -39,6 +40,21 @@ def get_abs(dev, code):
     return None
 
 
+def tilt_deg_per_unit(axinfo):
+    """Convert raw evdev tilt-axis units to degrees.
+
+    evdev convention: ABS_TILT_{X,Y} resolution is units/radian.
+    Fall back to assuming axis max maps to 90 deg if resolution unset.
+    """
+    if axinfo is None:
+        return 0.0
+    if getattr(axinfo, "resolution", 0) and axinfo.resolution > 0:
+        return 180.0 / (math.pi * axinfo.resolution)
+    if axinfo.max > 0:
+        return 90.0 / axinfo.max
+    return 1.0
+
+
 def discover_server(tablet_aspect, timeout_total=10.0, retry_interval=0.5):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -64,7 +80,8 @@ def discover_server(tablet_aspect, timeout_total=10.0, retry_interval=0.5):
 
 async def capture_and_send(dev, server_addr,
                            x_min, x_max, y_min, y_max,
-                           p_max, dist_max, grab):
+                           p_max, dist_max,
+                           tilt_x_scale, tilt_y_scale, grab):
     if grab:
         dev.grab()
 
@@ -135,7 +152,7 @@ async def capture_and_send(dev, server_addr,
                 seq, time.monotonic_ns(),
                 x_norm, y_norm,
                 p_norm,
-                float(st["tx"]), float(st["ty"]),
+                st["tx"] * tilt_x_scale, st["ty"] * tilt_y_scale,
                 d_norm,
                 st["buttons"], st["tool"], st["flags"],
             )
@@ -167,6 +184,8 @@ def main():
     ay = get_abs(dev, ecodes.ABS_Y)
     ap_ = get_abs(dev, ecodes.ABS_PRESSURE)
     ad = get_abs(dev, ecodes.ABS_DISTANCE)
+    atx = get_abs(dev, ecodes.ABS_TILT_X)
+    aty = get_abs(dev, ecodes.ABS_TILT_Y)
     if ax is None or ay is None or ap_ is None:
         print("Device missing required ABS axes.", file=sys.stderr)
         sys.exit(1)
@@ -175,6 +194,8 @@ def main():
     y_range = max(1, ay.max - ay.min)
     tablet_aspect = x_range / y_range
     dist_max = ad.max if ad is not None else 0
+    tilt_x_scale = tilt_deg_per_unit(atx)
+    tilt_y_scale = tilt_deg_per_unit(aty)
 
     print(f"Device: {dev.name}  ({dev.path})", flush=True)
     print(f"  ABS_X: [{ax.min}, {ax.max}]", flush=True)
@@ -182,6 +203,12 @@ def main():
     print(f"  ABS_PRESSURE: [0, {ap_.max}]", flush=True)
     if ad is not None:
         print(f"  ABS_DISTANCE: [0, {ad.max}]", flush=True)
+    if atx is not None:
+        print(f"  ABS_TILT_X: [{atx.min}, {atx.max}]  res={atx.resolution}  "
+              f"-> {tilt_x_scale:.6f} deg/unit", flush=True)
+    if aty is not None:
+        print(f"  ABS_TILT_Y: [{aty.min}, {aty.max}]  res={aty.resolution}  "
+              f"-> {tilt_y_scale:.6f} deg/unit", flush=True)
     print(f"  tablet aspect = {tablet_aspect:.6f}", flush=True)
 
     if args.server:
@@ -196,7 +223,8 @@ def main():
         asyncio.run(capture_and_send(
             dev, server_addr,
             ax.min, ax.max, ay.min, ay.max,
-            ap_.max, dist_max, grab=args.grab,
+            ap_.max, dist_max,
+            tilt_x_scale, tilt_y_scale, grab=args.grab,
         ))
     except KeyboardInterrupt:
         pass
