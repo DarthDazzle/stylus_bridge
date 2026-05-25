@@ -155,7 +155,13 @@ async def capture_and_send(dev, server_addr,
                 else:
                     st["tool"] = int(protocol.Tool.NONE)
                     st["flags"] &= ~int(protocol.Flag.IN_RANGE)
-            # BTN_TOOL_RUBBER: reserved, ignored.
+            elif ec == ecodes.BTN_TOOL_RUBBER:
+                if pressed:
+                    st["tool"] = int(protocol.Tool.RUBBER)
+                    st["flags"] |= int(protocol.Flag.IN_RANGE)
+                else:
+                    st["tool"] = int(protocol.Tool.NONE)
+                    st["flags"] &= ~int(protocol.Flag.IN_RANGE)
         elif et == ecodes.EV_SYN and ec == ecodes.SYN_REPORT:
             x_norm = (st["x"] - x_min) / x_range
             y_norm = (st["y"] - y_min) / y_range

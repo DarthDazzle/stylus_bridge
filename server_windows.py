@@ -41,8 +41,10 @@ PEN_MASK_PRESSURE = 0x00000001
 PEN_MASK_TILT_X   = 0x00000004
 PEN_MASK_TILT_Y   = 0x00000008
 
-PEN_FLAG_NONE   = 0x00000000
-PEN_FLAG_BARREL = 0x00000001
+PEN_FLAG_NONE     = 0x00000000
+PEN_FLAG_BARREL   = 0x00000001
+PEN_FLAG_INVERTED = 0x00000002
+PEN_FLAG_ERASER   = 0x00000004
 
 MONITORINFOF_PRIMARY = 0x00000001
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
@@ -231,7 +233,7 @@ def derive_flags(in_range, in_contact, was_in_range, was_in_contact, barrel):
     if in_contact:
         flags |= POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON
     if barrel:
-        flags |= POINTER_FLAG_SECONDBUTTON
+        flags |= POINTER_FLAG_THIRDBUTTON
         pen_flags |= PEN_FLAG_BARREL
 
     # Edge detection
@@ -357,7 +359,7 @@ def main():
                 continue
 
             (seq, _t_ns, x_n, y_n, p_n, tx, ty, _d_n,
-             buttons, _tool, flags_b) = protocol.unpack(data)
+             buttons, tool, flags_b) = protocol.unpack(data)
 
             # Drop out-of-order (wrap-aware: treat large backward jump as wrap)
             if last_seq >= 0:
@@ -383,6 +385,8 @@ def main():
             pressure = int(round(max(0.0, min(1.0, p_n)) * 1024))
             flags, pen_flags = derive_flags(
                 in_range, in_contact, was_in_range, was_in_contact, barrel)
+            if tool == int(protocol.Tool.RUBBER):
+                pen_flags |= PEN_FLAG_INVERTED | PEN_FLAG_ERASER
 
             info = make_pen_info(x_px, y_px, x_him, y_him,
                                  pressure, tx, ty, flags, pen_flags)
