@@ -256,11 +256,11 @@ def compute_fit_box(tablet_aspect, mon_rect):
 # ---------------------------------------------------------------------------
 # Injection
 # ---------------------------------------------------------------------------
-def make_pen_info(x_px, y_px, x_him, y_him, pressure_1024,
+def make_pen_info(pointer_id, x_px, y_px, x_him, y_him, pressure_1024,
                   tilt_x_deg, tilt_y_deg, flags, pen_flags):
     pi = POINTER_INFO()
     pi.pointerType = PT_PEN
-    pi.pointerId = 1
+    pi.pointerId = pointer_id
     pi.pointerFlags = flags
     pi.ptPixelLocation = POINT(int(round(x_px)), int(round(y_px)))
     pi.ptHimetricLocation = POINT(int(round(x_him)), int(round(y_him)))
@@ -436,13 +436,20 @@ def main():
     ap.add_argument("--monitor", type=int, default=None,
                     help="monitor index (skips prompt)")
     ap.add_argument("--barrel-action", default="middle",
-                    help="action for the pen barrel button: "
-                         "barrel | none | left | middle | right | key:NAME "
-                         "(default: middle)")
+                    help="action for the pen barrel button while pen tip is "
+                         "the active tool: barrel | none | left | middle | "
+                         "right | key:NAME  (default: middle)")
+    ap.add_argument("--eraser-barrel-action", default=None,
+                    help="action for the barrel button while the eraser end "
+                         "is the active tool. Same grammar as --barrel-action. "
+                         "Defaults to whatever --barrel-action is.")
     args = ap.parse_args()
 
-    action = parse_barrel_action(args.barrel_action)
-    print(f"Barrel-button action: {action.label}", flush=True)
+    pen_action = parse_barrel_action(args.barrel_action)
+    eraser_action_spec = args.eraser_barrel_action or args.barrel_action
+    eraser_action = parse_barrel_action(eraser_action_spec)
+    print(f"Barrel action (pen):    {pen_action.label}", flush=True)
+    print(f"Barrel action (eraser): {eraser_action.label}", flush=True)
 
     monitors = enumerate_monitors()
     if not monitors:
@@ -513,7 +520,12 @@ def main():
     last_seq = -1
     was_in_range = False
     was_in_contact = False
-    was_barrel = False
+    held_action = None              # action currently in pressed state
+    introduced = set()              # pointer ids that have seen POINTER_FLAG_NEW
+    prev_pointer_id = None          # last pointer id we injected for
+
+    def select_action(t):
+        return eraser_action if t == int(protocol.Tool.RUBBER) else pen_action
 
     try:
         while True:
@@ -547,26 +559,54 @@ def main():
             in_contact = bool(flags_b & int(protocol.Flag.IN_CONTACT))
             barrel = bool(buttons & int(protocol.Button.STYLUS))
 
-            # Barrel edge -> external action (mouse/key). Independent of
-            # in_range so the button still works during pure hover.
-            if barrel and not was_barrel:
-                action.press()
-            elif not barrel and was_barrel:
-                action.release()
-            was_barrel = barrel
+            current_action = select_action(tool)
+
+            # Barrel state machine: dispatch press/release on (barrel, action)
+            # changes. Handles tool switch while barrel is held by releasing
+            # the old action and pressing the new one.
+            desired = current_action if barrel else None
+            if desired is not held_action:
+                if held_action is not None:
+                    held_action.release()
+                if desired is not None:
+                    desired.press()
+                held_action = desired
 
             if not in_range and not was_in_range:
                 # Stylus left proximity earlier; nothing to inject
                 continue
 
+            pointer_id = 2 if tool == int(protocol.Tool.RUBBER) else 1
+
+            # Tool switch mid-session: emit final out-of-range frame for the
+            # previous pointer id so Windows closes its in-range session
+            # cleanly before the new id appears.
+            if (prev_pointer_id is not None
+                    and prev_pointer_id != pointer_id
+                    and prev_pointer_id in introduced):
+                final = make_pen_info(
+                    prev_pointer_id, x_px, y_px, x_him, y_him,
+                    0, 0, 0,
+                    POINTER_FLAG_UPDATE,  # no INRANGE -> leaves range
+                    PEN_FLAG_NONE)
+                user32.InjectSyntheticPointerInput(
+                    pen_device, ctypes.byref(final), 1)
+                introduced.discard(prev_pointer_id)
+                was_in_range = False
+                was_in_contact = False
+
             pressure = int(round(max(0.0, min(1.0, p_n)) * 1024))
             flags, pen_flags = derive_flags(
                 in_range, in_contact, was_in_range, was_in_contact,
-                barrel, action.uses_pen_barrel_flag)
+                barrel, current_action.uses_pen_barrel_flag)
             if tool == int(protocol.Tool.RUBBER):
                 pen_flags |= PEN_FLAG_INVERTED | PEN_FLAG_ERASER
 
-            info = make_pen_info(x_px, y_px, x_him, y_him,
+            if pointer_id not in introduced:
+                flags |= POINTER_FLAG_NEW
+                introduced.add(pointer_id)
+
+            info = make_pen_info(pointer_id, x_px, y_px, x_him, y_him,
                                  pressure, tx, ty, flags, pen_flags)
             ok = user32.InjectSyntheticPointerInput(
                 pen_device, ctypes.byref(info), 1)
@@ -576,13 +616,14 @@ def main():
                 print(f"InjectSyntheticPointerInput failed: {err}",
                       file=sys.stderr)
 
+            prev_pointer_id = pointer_id
             was_in_range = in_range
             was_in_contact = in_contact
     except KeyboardInterrupt:
         pass
     finally:
-        if was_barrel:
-            action.release()  # avoid stuck mouse/key on shutdown
+        if held_action is not None:
+            held_action.release()  # avoid stuck mouse/key on shutdown
         user32.DestroySyntheticPointerDevice(pen_device)
 
 
