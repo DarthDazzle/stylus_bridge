@@ -54,8 +54,12 @@ MOUSEEVENTF_LEFTDOWN   = 0x0002
 MOUSEEVENTF_LEFTUP     = 0x0004
 MOUSEEVENTF_RIGHTDOWN  = 0x0008
 MOUSEEVENTF_RIGHTUP    = 0x0010
+MOUSEEVENTF_MOVE       = 0x0001
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP   = 0x0040
+MOUSEEVENTF_WHEEL      = 0x0800
+
+VK_SHIFT = 0x10
 
 KEYEVENTF_KEYUP = 0x0002
 
@@ -322,6 +326,24 @@ def _mouse_input(flag):
     return inp
 
 
+def _wheel_input(delta):
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.mi.dwFlags = MOUSEEVENTF_WHEEL
+    # mouseData is DWORD but wheel delta is signed; wrap negative values
+    inp.mi.mouseData = ctypes.c_uint32(int(delta)).value
+    return inp
+
+
+def _move_input(dx, dy):
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.mi.dwFlags = MOUSEEVENTF_MOVE
+    inp.mi.dx = int(dx)
+    inp.mi.dy = int(dy)
+    return inp
+
+
 def _key_input(vk, up=False):
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
@@ -439,12 +461,20 @@ def main():
                     help="action for the pen barrel button while pen tip is "
                          "the active tool: barrel | none | left | middle | "
                          "right | key:NAME  (default: middle)")
+    ap.add_argument("--pinch-scroll-scale", type=float, default=2000.0,
+                    help="wheel units per unit of normalized finger separation "
+                         "change (default: 2000; 120 = one scroll notch)")
+    ap.add_argument("--pan-scale", type=float, default=1500.0,
+                    help="pixels per unit of normalized centroid delta "
+                         "for 2-finger pan (default: 1500)")
     ap.add_argument("--eraser-barrel-action", default=None,
                     help="action for the barrel button while the eraser end "
                          "is the active tool. Same grammar as --barrel-action. "
                          "Defaults to whatever --barrel-action is.")
     args = ap.parse_args()
 
+    pinch_scroll_scale = args.pinch_scroll_scale
+    pan_scale = args.pan_scale
     pen_action = parse_barrel_action(args.barrel_action)
     eraser_action_spec = args.eraser_barrel_action or args.barrel_action
     eraser_action = parse_barrel_action(eraser_action_spec)
@@ -520,6 +550,9 @@ def main():
     last_seq = -1
     was_in_range = False
     was_in_contact = False
+    was_touch_contact = False
+    scroll_accum = 0.0
+    pan_active = False
     held_action = None              # action currently in pressed state
     introduced = set()              # pointer ids that have seen POINTER_FLAG_NEW
     prev_pointer_id = None          # last pointer id we injected for
@@ -558,6 +591,34 @@ def main():
             in_range = bool(flags_b & int(protocol.Flag.IN_RANGE))
             in_contact = bool(flags_b & int(protocol.Flag.IN_CONTACT))
             barrel = bool(buttons & int(protocol.Button.STYLUS))
+
+            if tool == int(protocol.Tool.TOUCH):
+                if tx != 0.0 or x_n != 0.0 or y_n != 0.0:
+                    # 2-finger gesture: scroll and/or pan
+                    if tx != 0.0:
+                        scroll_accum += tx * pinch_scroll_scale
+                        notches = int(scroll_accum / 120) * 120
+                        if notches != 0:
+                            _send_inputs(_wheel_input(notches))
+                            scroll_accum -= notches
+                    if x_n != 0.0 or y_n != 0.0:
+                        if not pan_active:
+                            _send_inputs(_key_input(VK_SHIFT),
+                                         _mouse_input(MOUSEEVENTF_MIDDLEDOWN))
+                            pan_active = True
+                        _send_inputs(_move_input(x_n * pan_scale, y_n * pan_scale))
+                else:
+                    # Pure state packet: end pan if active, then handle middle mouse
+                    if pan_active:
+                        _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEUP),
+                                     _key_input(VK_SHIFT, up=True))
+                        pan_active = False
+                    if in_contact and not was_touch_contact:
+                        _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEDOWN))
+                    elif not in_contact and was_touch_contact:
+                        _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEUP))
+                    was_touch_contact = in_contact
+                continue
 
             current_action = select_action(tool)
 
@@ -623,7 +684,12 @@ def main():
         pass
     finally:
         if held_action is not None:
-            held_action.release()  # avoid stuck mouse/key on shutdown
+            held_action.release()
+        if pan_active:
+            _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEUP),
+                         _key_input(VK_SHIFT, up=True))
+        elif was_touch_contact:
+            _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEUP))
         user32.DestroySyntheticPointerDevice(pen_device)
 
 

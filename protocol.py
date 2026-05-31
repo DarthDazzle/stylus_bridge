@@ -40,7 +40,8 @@ class Button(IntFlag):
 class Tool(IntEnum):
     NONE = 0
     PEN = 1
-    RUBBER = 2  # reserved; deferred
+    RUBBER = 2
+    TOUCH = 3
 
 
 class Flag(IntFlag):

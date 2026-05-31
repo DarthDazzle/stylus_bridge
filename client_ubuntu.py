@@ -33,6 +33,22 @@ def find_tablet_device():
     return None
 
 
+def find_touch_device():
+    """First device with ABS_MT_POSITION_X/Y and BTN_TOUCH but not BTN_TOOL_PEN."""
+    for path in evdev.list_devices():
+        dev = evdev.InputDevice(path)
+        caps = dev.capabilities()
+        abs_codes = {c for c, _ in caps.get(ecodes.EV_ABS, [])}
+        key_codes = set(caps.get(ecodes.EV_KEY, []))
+        if (ecodes.ABS_MT_POSITION_X in abs_codes
+                and ecodes.ABS_MT_POSITION_Y in abs_codes
+                and ecodes.BTN_TOUCH in key_codes
+                and ecodes.BTN_TOOL_PEN not in key_codes):
+            return dev
+        dev.close()
+    return None
+
+
 def get_abs(dev, code):
     for c, info in dev.capabilities().get(ecodes.EV_ABS, []):
         if c == code:
@@ -89,6 +105,99 @@ def discover_server(tablet_aspect, timeout_total=10.0, retry_interval=0.5):
         raise TimeoutError("no server responded to discovery within timeout")
     finally:
         sock.close()
+
+
+async def capture_touch_and_send(dev, server_addr, grab,
+                                 mt_x_min, mt_x_range, mt_y_min, mt_y_range):
+    if grab:
+        dev.grab()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)
+
+    seq = 0
+    current_slot = 0
+    slots = {}          # slot_id -> {"tid": int, "x": int, "y": int}
+    middle_held = False
+    prev_sep = None
+    prev_cx = None
+    prev_cy = None
+    prev_n = 0
+
+    def get_slot(sid):
+        if sid not in slots:
+            slots[sid] = {"tid": -1, "x": 0, "y": 0}
+        return slots[sid]
+
+    def send_packet(in_contact, pinch_delta=0.0, cx_delta=0.0, cy_delta=0.0):
+        nonlocal seq
+        buf = protocol.pack(
+            seq, time.monotonic_ns(),
+            cx_delta, cy_delta, float(in_contact),
+            pinch_delta, 0.0, 0.0,
+            int(protocol.Button.TOUCH) if in_contact else 0,
+            int(protocol.Tool.TOUCH),
+            int(protocol.Flag.IN_CONTACT) if in_contact else 0,
+        )
+        try:
+            sock.sendto(buf, server_addr)
+        except OSError as e:
+            print(f"touch send error: {e}", file=sys.stderr)
+        seq = (seq + 1) & 0xFFFFFFFF
+
+    async for ev in dev.async_read_loop():
+        et, ec, val = ev.type, ev.code, ev.value
+        if et == ecodes.EV_ABS:
+            if ec == ecodes.ABS_MT_SLOT:
+                current_slot = val
+            elif ec == ecodes.ABS_MT_TRACKING_ID:
+                get_slot(current_slot)["tid"] = val
+            elif ec == ecodes.ABS_MT_POSITION_X:
+                get_slot(current_slot)["x"] = val
+            elif ec == ecodes.ABS_MT_POSITION_Y:
+                get_slot(current_slot)["y"] = val
+        elif et == ecodes.EV_SYN and ec == ecodes.SYN_REPORT:
+            n = sum(1 for s in slots.values() if s["tid"] >= 0)
+
+            # Leaving 2-finger: signal server to end pan before any other packet
+            if n != 2 and prev_n == 2:
+                send_packet(in_contact=False)
+
+            if n != 1 and middle_held:
+                send_packet(in_contact=False)
+                middle_held = False
+
+            if n == 1 and not middle_held:
+                send_packet(in_contact=True)
+                middle_held = True
+
+            if n == 2:
+                active = [s for s in slots.values() if s["tid"] >= 0]
+                a, b = active[0], active[1]
+                cx = ((a["x"] + b["x"]) / 2 - mt_x_min) / mt_x_range
+                cy = ((a["y"] + b["y"]) / 2 - mt_y_min) / mt_y_range
+                dx = (a["x"] - b["x"]) / mt_x_range
+                dy = (a["y"] - b["y"]) / mt_y_range
+                cur_sep = math.sqrt(dx * dx + dy * dy)
+
+                sep_delta = (cur_sep - prev_sep) if prev_sep is not None else 0.0
+                cx_delta = (cx - prev_cx) if prev_cx is not None else 0.0
+                cy_delta = (cy - prev_cy) if prev_cy is not None else 0.0
+
+                if sep_delta != 0.0 or cx_delta != 0.0 or cy_delta != 0.0:
+                    send_packet(in_contact=False,
+                                pinch_delta=sep_delta,
+                                cx_delta=cx_delta, cy_delta=cy_delta)
+
+                prev_sep = cur_sep
+                prev_cx = cx
+                prev_cy = cy
+            else:
+                prev_sep = None
+                prev_cx = None
+                prev_cy = None
+
+            prev_n = n
 
 
 async def capture_and_send(dev, server_addr,
@@ -250,13 +359,37 @@ def main():
         server_addr = discover_server(tablet_aspect)
         print(f"Server: {server_addr[0]}:{server_addr[1]}", flush=True)
 
-    try:
-        asyncio.run(capture_and_send(
+    touch_dev = find_touch_device()
+    mt_x_min = mt_y_min = 0
+    mt_x_range = mt_y_range = 1
+    if touch_dev is not None:
+        mt_ax = get_abs(touch_dev, ecodes.ABS_MT_POSITION_X)
+        mt_ay = get_abs(touch_dev, ecodes.ABS_MT_POSITION_Y)
+        mt_x_min = mt_ax.min if mt_ax else 0
+        mt_y_min = mt_ay.min if mt_ay else 0
+        mt_x_range = max(1, mt_ax.max - mt_ax.min) if mt_ax else 1
+        mt_y_range = max(1, mt_ay.max - mt_ay.min) if mt_ay else 1
+        print(f"Touch device: {touch_dev.name}  ({touch_dev.path})", flush=True)
+        print(f"  ABS_MT_POSITION_X: [{mt_x_min}, {mt_x_min + mt_x_range}]  "
+              f"ABS_MT_POSITION_Y: [{mt_y_min}, {mt_y_min + mt_y_range}]", flush=True)
+    else:
+        print("No touch device found; finger touch disabled.", flush=True)
+
+    async def run_all():
+        tasks = [capture_and_send(
             dev, server_addr,
             ax.min, ax.max, ay.min, ay.max,
             ap_.max, dist_max,
             tilt_x_scale, tilt_y_scale, grab=args.grab,
-        ))
+        )]
+        if touch_dev is not None:
+            tasks.append(capture_touch_and_send(
+                touch_dev, server_addr, args.grab,
+                mt_x_min, mt_x_range, mt_y_min, mt_y_range))
+        await asyncio.gather(*tasks)
+
+    try:
+        asyncio.run(run_all())
     except KeyboardInterrupt:
         pass
 
