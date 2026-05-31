@@ -593,6 +593,8 @@ def main():
             barrel = bool(buttons & int(protocol.Button.STYLUS))
 
             if tool == int(protocol.Tool.TOUCH):
+                if was_in_range:
+                    continue
                 if tx != 0.0 or x_n != 0.0 or y_n != 0.0:
                     # 2-finger gesture: scroll and/or pan
                     if tx != 0.0:
@@ -619,6 +621,16 @@ def main():
                         _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEUP))
                     was_touch_contact = in_contact
                 continue
+
+            if in_range and not was_in_range:
+                if pan_active:
+                    _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEUP),
+                                 _key_input(VK_SHIFT, up=True))
+                    pan_active = False
+                    scroll_accum = 0.0
+                elif was_touch_contact:
+                    _send_inputs(_mouse_input(MOUSEEVENTF_MIDDLEUP))
+                was_touch_contact = False
 
             current_action = select_action(tool)
 
